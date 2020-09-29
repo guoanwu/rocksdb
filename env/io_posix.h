@@ -288,10 +288,11 @@ class PosixMmapReadableFile : public FSRandomAccessFile {
   std::string filename_;
   void* mmapped_region_;
   size_t length_;
+  int is_pmem_;
 
  public:
   PosixMmapReadableFile(const int fd, const std::string& fname, void* base,
-                        size_t length, const EnvOptions& options);
+                        size_t length, int is_pmem,const EnvOptions& options);
   virtual ~PosixMmapReadableFile();
   virtual IOStatus Read(uint64_t offset, size_t n, const IOOptions& opts,
                         Slice* result, char* scratch,
@@ -310,6 +311,7 @@ class PosixMmapFile : public FSWritableFile {
   char* dst_;             // Where to write next  (in range [base_,limit_])
   char* last_sync_;       // Where have we synced up to
   uint64_t file_offset_;  // Offset of base_ in file
+  int is_pmem_;
 #ifdef ROCKSDB_FALLOCATE_PRESENT
   bool allow_fallocate_;  // If false, fallocate calls are bypassed
   bool fallocate_with_keep_size_;

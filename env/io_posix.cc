@@ -37,6 +37,7 @@
 #include "util/autovector.h"
 #include "util/coding.h"
 #include "util/string_util.h"
+#include "libpmem.h"
 
 #if defined(OS_LINUX) && !defined(F_SET_RW_HINT)
 #define F_LINUX_SPECIFIC_BASE 1024
@@ -832,8 +833,9 @@ IOStatus PosixRandomAccessFile::InvalidateCache(size_t offset, size_t length) {
 PosixMmapReadableFile::PosixMmapReadableFile(const int fd,
                                              const std::string& fname,
                                              void* base, size_t length,
-                                             const EnvOptions& options)
-    : fd_(fd), filename_(fname), mmapped_region_(base), length_(length) {
+    					     int is_pmem, 
+    					     const EnvOptions& options)
+    : fd_(fd), filename_(fname), mmapped_region_(base), length_(length),is_pmem_(is_pmem) {
 #ifdef NDEBUG
   (void)options;
 #endif
@@ -843,7 +845,13 @@ PosixMmapReadableFile::PosixMmapReadableFile(const int fd,
 }
 
 PosixMmapReadableFile::~PosixMmapReadableFile() {
-  int ret = munmap(mmapped_region_, length_);
+  int ret;
+  if(is_pmem_) {
+    ret = pmem_unmap(mmapped_region_, length_);
+  }
+  else { 
+    ret = munmap(mmapped_region_, length_);
+  }
   if (ret != 0) {
     fprintf(stdout, "failed to munmap %p length %" ROCKSDB_PRIszt " \n",
             mmapped_region_, length_);
@@ -874,14 +882,22 @@ IOStatus PosixMmapReadableFile::InvalidateCache(size_t offset, size_t length) {
   (void)length;
   return IOStatus::OK();
 #else
-  // free OS pages
-  int ret = Fadvise(fd_, offset, length, POSIX_FADV_DONTNEED);
-  if (ret == 0) {
-    return IOStatus::OK();
-  }
-  return IOError("While fadvise not needed. Offset " + ToString(offset) +
+  if(!is_pmem_) {
+    // free OS pages
+    int ret = Fadvise(fd_, offset, length, POSIX_FADV_DONTNEED);
+    if (ret == 0) {
+     	return IOStatus::OK();
+    }
+    return IOError("While fadvise not needed. Offset " + ToString(offset) +
                      " len" + ToString(length),
                  filename_, errno);
+  }
+  else {
+    (void)offset;
+    (void)length;
+    return IOStatus::OK();
+  }
+  
 #endif
 }
 
@@ -896,7 +912,14 @@ IOStatus PosixMmapReadableFile::InvalidateCache(size_t offset, size_t length) {
 IOStatus PosixMmapFile::UnmapCurrentRegion() {
   TEST_KILL_RANDOM("PosixMmapFile::UnmapCurrentRegion:0", rocksdb_kill_odds);
   if (base_ != nullptr) {
-    int munmap_status = munmap(base_, limit_ - base_);
+    int munmap_status;
+    if(file_offset_ == 0 && is_pmem_) {
+      munmap_status=pmem_unmap(base_,limit_ - base_);
+    }
+    else {
+      munmap_status = munmap(base_, limit_ - base_);
+    }
+
     if (munmap_status != 0) {
       return IOError("While munmap", filename_, munmap_status);
     }
@@ -918,26 +941,37 @@ IOStatus PosixMmapFile::MapNewRegion() {
 #ifdef ROCKSDB_FALLOCATE_PRESENT
   assert(base_ == nullptr);
   TEST_KILL_RANDOM("PosixMmapFile::UnmapCurrentRegion:0", rocksdb_kill_odds);
-  // we can't fallocate with FALLOC_FL_KEEP_SIZE here
-  if (allow_fallocate_) {
-    IOSTATS_TIMER_GUARD(allocate_nanos);
-    int alloc_status = fallocate(fd_, 0, file_offset_, map_size_);
-    if (alloc_status != 0) {
-      // fallback to posix_fallocate
-      alloc_status = posix_fallocate(fd_, file_offset_, map_size_);
+  
+  
+  void * ptr=MAP_FAILED;
+  if(file_offset_ == 0) {
+    ptr = pmem_map_file(filename_.c_str(), map_size_ , PMEM_FILE_CREATE, 0666, 0,  &is_pmem_);
+    if (ptr == NULL) {
+      return IOStatus::IOError("pmem_map_file MMap failed on " + filename_);
     }
-    if (alloc_status != 0) {
-      return IOStatus::IOError("Error allocating space to file : " + filename_ +
-                               "Error : " + strerror(alloc_status));
+  }
+  else {
+    // we can't fallocate with FALLOC_FL_KEEP_SIZE here
+    if (allow_fallocate_) {
+      IOSTATS_TIMER_GUARD(allocate_nanos);
+      int alloc_status = fallocate(fd_, 0, file_offset_, map_size_);
+      if (alloc_status != 0) {
+        // fallback to posix_fallocate
+        alloc_status = posix_fallocate(fd_, file_offset_, map_size_);
+      }
+      if (alloc_status != 0) {
+        return IOStatus::IOError("Error allocating space to file : " + filename_ +
+                             "Error : " + strerror(alloc_status));
+      }
+    }   
+    TEST_KILL_RANDOM("PosixMmapFile::Append:1", rocksdb_kill_odds);
+    ptr = mmap(nullptr, map_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_,
+                   file_offset_);
+    if (ptr == MAP_FAILED) {
+      return IOStatus::IOError("MMap failed on " + filename_);
     }
   }
 
-  TEST_KILL_RANDOM("PosixMmapFile::Append:1", rocksdb_kill_odds);
-  void* ptr = mmap(nullptr, map_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_,
-                   file_offset_);
-  if (ptr == MAP_FAILED) {
-    return IOStatus::IOError("MMap failed on " + filename_);
-  }
   TEST_KILL_RANDOM("PosixMmapFile::Append:2", rocksdb_kill_odds);
 
   base_ = reinterpret_cast<char*>(ptr);
@@ -960,6 +994,7 @@ IOStatus PosixMmapFile::Msync() {
   size_t p2 = TruncateToPageBoundary(dst_ - base_ - 1);
   last_sync_ = dst_;
   TEST_KILL_RANDOM("PosixMmapFile::Msync:0", rocksdb_kill_odds);
+  
   if (msync(base_ + p1, p2 - p1 + page_size_, MS_SYNC) < 0) {
     return IOError("While msync", filename_, errno);
   }
@@ -976,7 +1011,8 @@ PosixMmapFile::PosixMmapFile(const std::string& fname, int fd, size_t page_size,
       limit_(nullptr),
       dst_(nullptr),
       last_sync_(nullptr),
-      file_offset_(0) {
+      file_offset_(0),
+      is_pmem_(0){
 #ifdef ROCKSDB_FALLOCATE_PRESENT
   allow_fallocate_ = options.allow_fallocate;
   fallocate_with_keep_size_ = options.fallocate_with_keep_size;
@@ -1017,7 +1053,14 @@ IOStatus PosixMmapFile::Append(const Slice& data, const IOOptions& /*opts*/,
 
     size_t n = (left <= avail) ? left : avail;
     assert(dst_);
-    memcpy(dst_, src, n);
+  
+    if(!is_pmem_) {
+      memcpy(dst_, src, n);
+    }
+    else
+    {
+      pmem_memcpy_persist(dst_,src,n);
+    }
     dst_ += n;
     src += n;
     left -= n;
@@ -1045,7 +1088,7 @@ IOStatus PosixMmapFile::Close(const IOOptions& /*opts*/,
       s = IOError("While closing mmapped file", filename_, errno);
     }
   }
-
+  is_pmem_=0;
   fd_ = -1;
   base_ = nullptr;
   limit_ = nullptr;
@@ -1059,11 +1102,16 @@ IOStatus PosixMmapFile::Flush(const IOOptions& /*opts*/,
 
 IOStatus PosixMmapFile::Sync(const IOOptions& /*opts*/,
                              IODebugContext* /*dbg*/) {
-  if (fdatasync(fd_) < 0) {
-    return IOError("While fdatasync mmapped file", filename_, errno);
+  if(!is_pmem_) {  
+    if (fdatasync(fd_) < 0) {
+      return IOError("While fdatasync mmapped file", filename_, errno);
+    }
+  
+    return Msync();
+  } 
+  else {
+    return IOStatus::OK();
   }
-
-  return Msync();
 }
 
 /**
@@ -1071,11 +1119,17 @@ IOStatus PosixMmapFile::Sync(const IOOptions& /*opts*/,
  */
 IOStatus PosixMmapFile::Fsync(const IOOptions& /*opts*/,
                               IODebugContext* /*dbg*/) {
-  if (fsync(fd_) < 0) {
-    return IOError("While fsync mmaped file", filename_, errno);
-  }
+  if(!is_pmem_) {
+    if (fsync(fd_) < 0) {
+      return IOError("While fsync mmaped file", filename_, errno);
+    }
 
-  return Msync();
+    return Msync();
+  }
+  else
+  {
+    return IOStatus::OK();	  
+  }
 }
 
 /**
@@ -1095,12 +1149,20 @@ IOStatus PosixMmapFile::InvalidateCache(size_t offset, size_t length) {
   (void)length;
   return IOStatus::OK();
 #else
-  // free OS pages
-  int ret = Fadvise(fd_, offset, length, POSIX_FADV_DONTNEED);
-  if (ret == 0) {
+  if(!is_pmem_) {
+    // free OS pages
+    int ret = Fadvise(fd_, offset, length, POSIX_FADV_DONTNEED);
+    if (ret == 0) {
+      return IOStatus::OK();
+    }
+    return IOError("While fadvise NotNeeded mmapped file", filename_, errno);
+  }
+  else {
+    (void)offset;
+    (void)length;
     return IOStatus::OK();
   }
-  return IOError("While fadvise NotNeeded mmapped file", filename_, errno);
+
 #endif
 }
 

@@ -468,7 +468,7 @@ endif
 CFLAGS += $(WARNING_FLAGS) -I. -I./include $(PLATFORM_CCFLAGS) $(OPT)
 CXXFLAGS += $(WARNING_FLAGS) -I. -I./include $(PLATFORM_CXXFLAGS) $(OPT) -Woverloaded-virtual -Wnon-virtual-dtor -Wno-missing-field-initializers
 
-LDFLAGS += $(PLATFORM_LDFLAGS)
+LDFLAGS += $(PLATFORM_LDFLAGS) -lpmem
 
 # If NO_UPDATE_BUILD_VERSION is set we don't update util/build_version.cc, but
 # the file needs to already exist or else the build will fail

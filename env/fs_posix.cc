@@ -78,6 +78,8 @@
 #define EXT4_SUPER_MAGIC 0xEF53
 #endif
 
+#include <libpmem.h>
+
 namespace ROCKSDB_NAMESPACE {
 
 namespace {
@@ -208,7 +210,8 @@ class PosixFileSystem : public FileSystem {
     result->reset();
     IOStatus s = IOStatus::OK();
     int fd;
-    int flags = cloexec_flags(O_RDONLY, &options);
+    int 
+	    flags = cloexec_flags(O_RDONLY, &options);
 
     if (options.use_direct_reads && !options.use_mmap_reads) {
 #ifdef ROCKSDB_LITE
@@ -237,12 +240,17 @@ class PosixFileSystem : public FileSystem {
       // Use mmap when virtual address-space is plentiful.
       uint64_t size;
       IOOptions opts;
+      int is_pmem;
       s = GetFileSize(fname, opts, &size, nullptr);
       if (s.ok()) {
-        void* base = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
-        if (base != MAP_FAILED) {
+	// dennis: use libpmem mmap to make sure if the mmap is pmem (dax) file or the normal file
+	//void* base = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+	void * base = pmem_map_file(fname.c_str(),size,PMEM_FILE_CREATE,0666, 0,&is_pmem);
+	//is_pmem=pmem_is_pmem(base,size);
+        //is_pmem=1;
+	if (base != MAP_FAILED) {
           result->reset(
-              new PosixMmapReadableFile(fd, fname, base, size, options));
+              new PosixMmapReadableFile(fd, fname, base, size, is_pmem,options));
         } else {
           s = IOError("while mmap file for read", fname, errno);
           close(fd);
